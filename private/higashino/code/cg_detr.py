@@ -93,9 +93,11 @@ from misc import accuracy
 import numpy as np
 import copy
 
-def inverse_sigmoid(x, eps=1e-5):
-    x = x.float().clamp(min=0.0, max=1.0)
-    return torch.logit(x, eps=eps)
+def inverse_sigmoid(x, eps=1e-3):
+    x = x.clamp(min=0, max=1)
+    x1 = x.clamp(min=eps)
+    x2 = (1 - x).clamp(min=eps)
+    return torch.log(x1/x2)
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -152,11 +154,7 @@ class CGDETR(nn.Module):
         super().__init__()
         self.args=args
         self.num_queries = num_queries
-        # self.transformer = transformer
-        self.transformer = torch.compile(
-            transformer, 
-            backend="inductor", mode="default", dynamic=True
-        )
+        self.transformer = transformer
         self.position_embed = position_embed
         self.txt_position_embed = txt_position_embed
         hidden_dim = transformer.d_model
@@ -207,16 +205,6 @@ class CGDETR(nn.Module):
         scls_encoder_layer = TransformerEncoderLayer(hidden_dim, 8, self.args.dim_feedforward, 0.1, "prelu", normalize_before)
         scls_encoder_norm = nn.LayerNorm(hidden_dim) if normalize_before else None
         self.scls_encoder = TransformerEncoder(scls_encoder_layer, args.sent_layers, scls_encoder_norm)
-
-        # Registerトークンの定義 (例: args.num_registers で数を指定)
-        self.num_registers = args.num_registers
-        if self.num_registers > 0:
-            # 1. 空のテンソルを作成
-            self.register_tokens = nn.Parameter(torch.empty(self.num_registers, 1, args.hidden_dim))
-            # 2. ViTの標準である std=0.02 の正規分布で初期化し、対称性を破る
-            nn.init.normal_(self.register_tokens, std=0.02)
-        else:
-            self.register_tokens = None
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, src_aud=None, src_aud_mask=None, targets=None):
         """The forward expects two tensors:
@@ -338,20 +326,14 @@ class CGDETR(nn.Module):
 
             txt_dummy_proj = torch.cat([smemory_words_dummy, smemory_words], dim=0)
 
-            hs, reference, memory, memory_global, attn_weights, memory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames = self.transformer(
-                src, ~mask, self.query_embed.weight, pos, video_length=video_length, moment_idx=targets["relevant_clips"], msrc=msrc, mpos=mpos, mmask=~mmask, nmsrc=nmsrc, nmpos=nmpos, nmmask=~nmmask,
-                ctxtoken=vidsrc_, gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask.sum(1).long(), 
-                register_tokens=self.register_tokens
-            )
+            hs, reference, memory, memory_global, attn_weights, memory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames = self.transformer(src, ~mask, self.query_embed.weight, pos, video_length=video_length, moment_idx=targets["relevant_clips"], msrc=msrc, mpos=mpos, mmask=~mmask, nmsrc=nmsrc, nmpos=nmpos, nmmask=~nmmask,
+                                                                                                                  ctxtoken=vidsrc_, gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask.sum(1).long())
             moment2txt_similarity = torch.matmul(mmemory_frames.permute(1, 0, 2), txt_dummy_proj.permute(1, 2, 0))
             nmoment2txt_similarity = torch.matmul(nmmemory_frames.permute(1, 0, 2), txt_dummy_proj.permute(1, 2, 0))
         else: ## inference
             sentence_dummy, sentence_txt, moment2txt_similarity, nmoment2txt_similarity = None, None, None, None
-            hs, reference, memory, memory_global, attn_weights, memory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames = self.transformer(
-                src, ~mask, self.query_embed.weight, pos, video_length=video_length,
-                ctxtoken=vidsrc_, gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask.sum(1).long(),
-                register_tokens=self.register_tokens
-            )
+            hs, reference, memory, memory_global, attn_weights, memory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames = self.transformer(src, ~mask, self.query_embed.weight, pos, video_length=video_length,
+                                                                                                                  ctxtoken=vidsrc_, gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask.sum(1).long())
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
         reference_before_sigmoid = inverse_sigmoid(reference)
         tmp = self.span_embed(hs)
@@ -381,11 +363,8 @@ class CGDETR(nn.Module):
                 pos_neg = pos_neg[real_neg_mask]
                 src_txt_mask_dummy_neg = src_txt_mask_dummy_neg[real_neg_mask]
 
-                _, _, memory_neg, memory_global_neg, attn_weights_neg, _, _, _, _ = self.transformer(
-                    src_dummy_neg, ~mask_dummy_neg, self.query_embed.weight, pos_neg, video_length=video_length,
-                    ctxtoken=vidsrc_[real_neg_mask], gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask[real_neg_mask].sum(1).long(),
-                    register_tokens=self.register_tokens
-                )
+                _, _, memory_neg, memory_global_neg, attn_weights_neg, _, _, _, _ = self.transformer(src_dummy_neg, ~mask_dummy_neg, self.query_embed.weight, pos_neg, video_length=video_length,
+                                                                                               ctxtoken=vidsrc_[real_neg_mask], gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask[real_neg_mask].sum(1).long())
                 vid_mem_neg = memory_neg[:, :src_vid.shape[1]]
                 out["saliency_scores_neg"] = (torch.sum(self.saliency_proj1(vid_mem_neg) * self.saliency_proj2(memory_global_neg).unsqueeze(1), dim=-1) / np.sqrt(self.hidden_dim))
                 out["src_txt_mask_neg"] = src_txt_mask_dummy_neg
@@ -405,6 +384,11 @@ class CGDETR(nn.Module):
         out["saliency_scores"] = (torch.sum(self.saliency_proj1(vid_mem) * self.saliency_proj2(memory_global).unsqueeze(1), dim=-1) / np.sqrt(self.hidden_dim))
         out["memory_moment"] = memory_moment
         out["nmmemory_moment"] = nmmemory_moment
+
+        # Sim-DETR GLB Loss inputs: last-layer decoder queries and video memory.
+        # hs shape from cg_detr_transformer: (num_layers, bs, num_queries, d)
+        out["hs"] = hs[-1]            # (bs, num_queries, d)
+        out["vid_mem"] = vid_mem      # (bs, L_vid, d)
 
         ## sentence token embeeded with text / dummy
         out["sentence_txt"] = sentence_txt
@@ -901,6 +885,59 @@ class SetCriterion(nn.Module):
         loss_dummy_ortho += global_tokens_sim.abs().mean()
         return {"loss_orthogonal_dummy": loss_dummy_ortho}
 
+    def loss_glb(self, outputs, targets, indices, log=True):
+        """Sim-DETR Global-Local Bridging Loss.
+
+        For each matched (query q_i, gt span s_i), increase cosine similarity
+        between q_i and frames inside s_i (InfoNCE-style log-sum-exp).
+        """
+        if "hs" not in outputs or "vid_mem" not in outputs or indices is None:
+            return {"loss_glb": outputs["pred_spans"].new_zeros([])}
+
+        hs = outputs["hs"]            # (bs, num_queries, d)
+        vid_mem = outputs["vid_mem"]  # (bs, L_vid, d)
+        video_mask = outputs.get("video_mask", None)
+        L_vid = vid_mem.shape[1]
+
+        hs_norm = F.normalize(hs, dim=-1)
+        vid_norm = F.normalize(vid_mem, dim=-1)
+        sim = torch.bmm(hs_norm, vid_norm.transpose(1, 2))  # (bs, Nq, L_vid)
+
+        tau = getattr(self.args, 'glb_tau', 0.07)
+        sim = sim / tau
+
+        if video_mask is not None:
+            sim = sim.masked_fill(~video_mask.bool().unsqueeze(1), -1e9)
+
+        span_labels = targets["span_labels"]
+        losses_list = []
+
+        for b, (src_idx, tgt_idx) in enumerate(indices):
+            for qi, ti in zip(src_idx.tolist(), tgt_idx.tolist()):
+                span = span_labels[b]['spans'][ti]  # (cx, w) in [0,1]
+                cx = float(span[0])
+                w = float(span[1])
+                start = int(max(0, (cx - w / 2) * L_vid))
+                end = int(min(L_vid, (cx + w / 2) * L_vid))
+                if end <= start:
+                    continue
+
+                sim_q = sim[b, qi]
+                mask_pos = torch.zeros(L_vid, dtype=torch.bool, device=sim_q.device)
+                mask_pos[start:end] = True
+                if video_mask is not None:
+                    mask_pos = mask_pos & video_mask[b].bool()
+                if mask_pos.sum() == 0:
+                    continue
+
+                log_denom = torch.logsumexp(sim_q, dim=0)
+                log_numer = torch.logsumexp(sim_q[mask_pos], dim=0)
+                losses_list.append(log_denom - log_numer)
+
+        if not losses_list:
+            return {"loss_glb": hs.new_zeros([])}
+        return {"loss_glb": torch.stack(losses_list).mean()}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -920,7 +957,8 @@ class SetCriterion(nn.Module):
             "saliency": self.loss_saliency,
             "ms_align": self.loss_contrastive_moment_sentence,
             "distill": self.loss_moment2txt_sim_distill,
-            "orthogonal_dummy":self.loss_orthogonal_dummy
+            "orthogonal_dummy":self.loss_orthogonal_dummy,
+            "glb": self.loss_glb,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, **kwargs)
@@ -968,6 +1006,8 @@ class SetCriterion(nn.Module):
                     if "distill" == loss:
                         continue
                     if "orthogonal_dummy" == loss:
+                        continue
+                    if "glb" == loss:  # GLB uses last-layer hs only; skip aux
                         continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)
@@ -1043,19 +1083,30 @@ def build_model(args):
                    "loss_distill": args.lw_distill,
                    "loss_orthogonal_dummy":args.lw_distill}
 
+    # Sim-DETR GLB loss (only added when lw_glb > 0)
+    lw_glb = getattr(args, 'lw_glb', 0.0)
+    if lw_glb > 0:
+        weight_dict["loss_glb"] = lw_glb
+
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items() if k != "loss_saliency"})
+            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()
+                                    if k not in ("loss_saliency", "loss_glb")})
         weight_dict.update(aux_weight_dict)
 
     losses = ['spans', 'labels', 'saliency', 'ms_align', 'distill', 'orthogonal_dummy']
+    if lw_glb > 0:
+        losses.append('glb')
+
+    # For highlight detection datasets
+    use_matcher = not (args.dset_name in ['youtube_highlight', 'tvsum'])
 
     criterion = SetCriterion(
         matcher=matcher, weight_dict=weight_dict, losses=losses,
         eos_coef=args.eos_coef, span_loss_type=args.span_loss_type,
         max_v_l=args.max_v_l, saliency_margin=args.saliency_margin, 
-        use_matcher=True, args=args)
+        use_matcher=use_matcher, args=args)
     criterion.to(device)
 
     return model, criterion
