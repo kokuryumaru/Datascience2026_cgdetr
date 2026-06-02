@@ -12,16 +12,77 @@ distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 License for the specific language governing permissions and limitations
 under the License.
+
+Copyright (c) 2023 WonJun Moon
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Copyright (c) 2022 WonJun Moon
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Moment-DETR (https://github.com/jayleicn/moment_detr)
+Copyright (c) 2021 Jie Lei
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
 
 # ------------------------------------------------------------------------
 # DAB-DETR
 # Copyright (c) 2022 IDEA. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 # Modified from Conditional DETR (https://github.com/Atten4Vis/ConditionalDETR)
 # Copyright (c) 2021 Microsoft. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 # Modified from DETR (https://github.com/facebookresearch/detr)
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
@@ -34,6 +95,8 @@ MultiheadAttention that support query, key, and value to have different dimensio
 Query, key, and value projections are removed.
 Mostly copy-paste from https://github.com/pytorch/pytorch/blob/master/torch/nn/modules/activation.py#L873
 and https://github.com/pytorch/pytorch/blob/master/torch/nn/functional.py#L4837
+
+This code is used only for CG-DETR, not used for other vmr methods: QD-DETR, moment-DETR, and EaTR
 """
 
 import copy
@@ -100,8 +163,9 @@ class MultiheadAttention(Module):
     bias_k: Optional[torch.Tensor]
     bias_v: Optional[torch.Tensor]
 
-    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None):
+    def __init__(self, embed_dim, num_heads, dropout=0., num_dummies=3, bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None, vdim=None):
         super(MultiheadAttention, self).__init__()
+        self.num_dummies = num_dummies
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
@@ -137,7 +201,7 @@ class MultiheadAttention(Module):
         super(MultiheadAttention, self).__setstate__(state)
 
     def forward(self, query, key, value, key_padding_mask=None,
-                need_weights=True, attn_mask=None):
+                need_weights=True, attn_mask=None, dummy=True):
         # type: (Tensor, Tensor, Tensor, Optional[Tensor], bool, Optional[Tensor]) -> Tuple[Tensor, Optional[Tensor]]
         r"""
     Args:
@@ -186,7 +250,7 @@ class MultiheadAttention(Module):
                 key_padding_mask=key_padding_mask, need_weights=need_weights,
                 attn_mask=attn_mask, use_separate_proj_weight=True,
                 q_proj_weight=self.q_proj_weight, k_proj_weight=self.k_proj_weight,
-                v_proj_weight=self.v_proj_weight, out_dim=self.vdim)
+                v_proj_weight=self.v_proj_weight, out_dim=self.vdim, num_dummies=self.num_dummies, dummy=dummy)
         else:
             return multi_head_attention_forward(
                 query, key, value, self.embed_dim, self.num_heads,
@@ -195,7 +259,7 @@ class MultiheadAttention(Module):
                 self.dropout, self.out_proj.weight, self.out_proj.bias,
                 training=self.training,
                 key_padding_mask=key_padding_mask, need_weights=need_weights,
-                attn_mask=attn_mask, out_dim=self.vdim)
+                attn_mask=attn_mask, out_dim=self.vdim, num_dummies=self.num_dummies, dummy=dummy)
 
 
 def multi_head_attention_forward(query: Tensor,
@@ -221,7 +285,9 @@ def multi_head_attention_forward(query: Tensor,
                                  v_proj_weight: Optional[Tensor] = None,
                                  static_k: Optional[Tensor] = None,
                                  static_v: Optional[Tensor] = None,
-                                 out_dim: Optional[Tensor] = None
+                                 out_dim: Optional[Tensor] = None,
+                                 num_dummies=3,
+                                 dummy=True,
                                  ) -> Tuple[Tensor, Optional[Tensor]]:
     r"""
     Args:
@@ -391,13 +457,12 @@ def multi_head_attention_forward(query: Tensor,
         )
         attn_output_weights = attn_output_weights.view(bsz * num_heads, tgt_len, src_len)
 
-    # attn_output_weights = softmax(
-    #     attn_output_weights, dim=-1)
-    attn_output_weights = softmax(
-            attn_output_weights - attn_output_weights.max(dim=-1, keepdim=True)[0], dim=-1)
-    attn_output_weights = dropout(attn_output_weights, p=dropout_p, training=training)
-
-    attn_output = torch.bmm(attn_output_weights, v)
+    attn_output_weights = softmax(attn_output_weights, dim=-1)
+    attn_output_weights_d = dropout(attn_output_weights, p=dropout_p, training=training)
+    if dummy:
+        attn_output = torch.bmm(attn_output_weights_d[:, :, num_dummies:], v[:, num_dummies:,:])
+    else:
+        attn_output = torch.bmm(attn_output_weights_d, v)
     assert list(attn_output.size()) == [bsz * num_heads, tgt_len, v_head_dim]
     attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, out_dim)
     attn_output = linear(attn_output, out_proj_weight, out_proj_bias)

@@ -1,192 +1,149 @@
-import argparse
-import pprint
-
-from tqdm import tqdm, trange
-import numpy as np
 import os
-from collections import OrderedDict, defaultdict
-from easydict import EasyDict
-
-import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from basic_utils import AverageMeter
-from span_utils import span_cxw_to_xx
-
-from config import BaseOptions
+import yaml
+import pprint
+import argparse
 
 import torch
-import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
+torch.set_float32_matmul_precision('high')
+from easydict import EasyDict
+from tqdm import tqdm
 
-from dataset import StartEndDataset, start_end_collate, prepare_batch_inputs
+from dataset import CGDETR_StartEndDataset, cg_detr_start_end_collate, cg_detr_prepare_batch_inputs
+from cg_detr import build_model
+from basic_utils import mkdirp, save_jsonl, save_json
 from postprocessing import PostProcessorDETR
+from span_utils import span_cxw_to_xx
 from standalone_eval.eval import eval_submission
 
-from basic_utils import save_jsonl, save_json
-from qd_detr import build_model as build_model_qd_detr
-
 import logging
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(asctime)s.%(msecs)03d:%(levelname)s:%(name)s - %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S",
                     level=logging.INFO)
 
 
-def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filename):
-    logger.info("Saving/Evaluating before nms results")
-    submission_path = os.path.join(opt.results_dir, save_submission_filename)
-    save_jsonl(submission, submission_path)
-
-    if opt.eval_split_name in ["val", "test"]:
-        metrics = eval_submission(submission, gt_data)
-        save_metrics_path = submission_path.replace(".jsonl", "_metrics.json")
-        save_json(metrics, save_metrics_path, save_pretty=True, sort_keys=False)
-        latest_file_paths = [submission_path, save_metrics_path]
-    else:
-        metrics = None
-        latest_file_paths = [submission_path, ]
-
-    return metrics, latest_file_paths
-
-
 @torch.no_grad()
-def compute_mr_results(model, eval_loader, opt, criterion=None):
-    batch_input_fn = cg_detr_prepare_batch_inputs if opt.model_name == 'cg_detr' else prepare_batch_inputs
-    loss_meters = defaultdict(AverageMeter)
-
+def compute_mr_results(model, eval_loader, opt):
     mr_res = []
-    for batch in tqdm(eval_loader, desc="compute st ed scores"):
+    for batch in tqdm(eval_loader, desc="compute st ed scores", 
+                      bar_format='{percentage:3.0f}% | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
         query_meta = batch[0]
-        model_inputs, targets = batch_input_fn(batch[1], opt.device)
-        outputs = model(**model_inputs)
+        model_inputs, targets = cg_detr_prepare_batch_inputs(batch[1], opt.device)
+        outputs = model(**model_inputs, targets=targets)
 
-        # compose predictions
-        pred_spans = outputs["pred_spans"].cpu()  # (bsz, #queries, 2)
-        prob = F.softmax(outputs["pred_logits"], -1)  # (batch_size, #queries, #classes=2)
-        scores = prob[..., 0].cpu()  # * (batch_size, #queries)  foreground label is 0, we directly take it
+        _saliency_scores = outputs["saliency_scores"].half()
+        saliency_scores = []
+        valid_vid_lengths = model_inputs["src_vid_mask"].sum(1).cpu().tolist()
+        for j in range(len(valid_vid_lengths)):
+            saliency_scores.append(_saliency_scores[j, :int(valid_vid_lengths[j])].tolist())
 
-        for idx, (meta, spans, score) in enumerate(zip(query_meta, pred_spans, scores)):            
+        pred_spans = outputs["pred_spans"].cpu()
+        prob = torch.nn.functional.softmax(outputs["pred_logits"], -1)
+        scores = prob[..., 0].cpu()
+
+        for idx, (meta, spans, score) in enumerate(zip(query_meta, pred_spans, scores)):
             spans = span_cxw_to_xx(spans) * meta["duration"]
             cur_ranked_preds = torch.cat([spans, score[:, None]], dim=1).tolist()
             cur_ranked_preds = sorted(cur_ranked_preds, key=lambda x: x[2], reverse=True)
             cur_ranked_preds = [[float(f"{e:.4f}") for e in row] for row in cur_ranked_preds]
-
-            cur_query_pred = dict(
-                qid=meta["qid"],
-                query=meta["query"],
-                vid=meta["vid"],
+            mr_res.append(dict(
+                qid=meta["qid"], query=meta["query"], vid=meta["vid"],
                 pred_relevant_windows=cur_ranked_preds,
-            )
-
-            mr_res.append(cur_query_pred)
-
-        if criterion:
-            loss_dict = criterion(outputs, targets)
-            weight_dict = criterion.weight_dict
-            losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-            loss_dict["loss_overall"] = float(losses)
-            for k, v in loss_dict.items():
-                loss_meters[k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
+            ))
 
     post_processor = PostProcessorDETR(
         clip_length=opt.clip_length, min_ts_val=0, max_ts_val=300,
         min_w_l=1, max_w_l=300, move_window_method="left",
         process_func_names=("clip_ts", "round_multiple")
     )
-
-    mr_res = post_processor(mr_res)
-    return mr_res, loss_meters
-
-
-def get_eval_res(model, eval_loader, opt, criterion):
-    """compute and save query and video proposal embeddings"""
-    eval_res, eval_loss_meters = compute_mr_results(model, eval_loader, opt, criterion)
-    return eval_res, eval_loss_meters
-
-
-def eval_epoch(model, eval_dataset, opt, save_submission_filename, criterion):
-    logger.info("Generate submissions")
-    model.eval()
-    criterion.eval()
-
-    eval_loader = DataLoader(
-        eval_dataset,
-        collate_fn=start_end_collate,
-        batch_size=opt.eval_bsz,
-        num_workers=opt.num_workers,
-        shuffle=False,
-    )
-
-    submission, eval_loss_meters = get_eval_res(model, eval_loader, opt, criterion)        
-    metrics, latest_file_paths = eval_epoch_post_processing(
-        submission, opt, eval_dataset.data, save_submission_filename)
-    return metrics, eval_loss_meters, latest_file_paths
-
-
-def setup_model(opt):
-    """setup model/optimizer/scheduler and load checkpoints when needed"""
-    logger.info("setup model/optimizer/scheduler")
-    model, criterion = build_model_qd_detr(opt)
-
-    if opt.device == "cuda":
-        logger.info("CUDA enabled.")
-        model.to(opt.device)
-        criterion.to(opt.device)
-
-    param_dicts = [{"params": [p for n, p in model.named_parameters() if p.requires_grad]}]
-    optimizer = torch.optim.AdamW(param_dicts, lr=opt.lr, weight_decay=opt.wd)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, opt.lr_drop)
-
-    return model, criterion, optimizer, lr_scheduler
+    return post_processor(mr_res)
 
 
 def start_inference(opt):
     logger.info("Setup config, data and model...")
+    cudnn.benchmark = True
+    load_labels = opt.eval_split_name in ['val', 'test']
 
-    # dataset & data loader
+    data_path = opt.val_path if opt.eval_split_name == 'val' else opt.test_path
     dataset_config = EasyDict(
-        data_path=opt.val_path if opt.eval_split_name == 'val' else opt.test_path,
+        dset_name=opt.dset_name,
+        domain=None,
+        data_path=data_path,
         ctx_mode=opt.ctx_mode,
-        a_feat_dir=opt.a_feat_dir,
+        v_feat_dirs=None,
+        a_feat_dirs=[opt.a_feat_dir],
         q_feat_dir=opt.t_feat_dir,
         q_feat_type="last_hidden_state",
-        a_feat_type=opt.a_feat_type,
+        v_feat_types=None,
+        a_feat_types=opt.a_feat_type,
         max_q_l=opt.max_q_l,
+        max_v_l=opt.max_a_l,
         max_a_l=opt.max_a_l,
         clip_len=opt.clip_length,
         max_windows=opt.max_windows,
         span_loss_type=opt.span_loss_type,
-        load_labels=True,
+        load_labels=load_labels,
     )
-    
-    eval_dataset = StartEndDataset(**dataset_config)
-    model, criterion, _, _ = setup_model(opt)
+    eval_dataset = CGDETR_StartEndDataset(**dataset_config)
+
+    model, criterion = build_model(opt)
+    if opt.device == "cuda":
+        logger.info("CUDA enabled.")
+        model.to(opt.device)
     checkpoint = torch.load(opt.model_path, weights_only=False)
-    model.load_state_dict(checkpoint["model"])
-    logger.info("Model checkpoint: {}".format(opt.model_path))
+    loaded_state_dict = checkpoint['model']
+    model_state_dict = model.state_dict()
+    adapted_state_dict = {}
+    for k, v in loaded_state_dict.items():
+        clean_k = k.replace('_orig_mod.', '')
+        compiled_k = clean_k.replace('transformer.', 'transformer._orig_mod.')
+        if compiled_k in model_state_dict:
+            adapted_state_dict[compiled_k] = v
+        else:
+            adapted_state_dict[clean_k] = v
+    model.load_state_dict(adapted_state_dict)
+    logger.info(f"Model checkpoint: {opt.model_path}")
+    model.eval()
+
+    eval_loader = DataLoader(
+        eval_dataset, collate_fn=cg_detr_start_end_collate,
+        batch_size=opt.eval_bsz, num_workers=opt.num_workers, shuffle=False,
+    )
 
     logger.info("Starting inference...")
-    save_submission_filename = "submission.jsonl"
+    submission = compute_mr_results(model, eval_loader, opt)
 
-    with torch.no_grad():
-        metrics, eval_loss_meters, latest_file_paths = \
-            eval_epoch(model, eval_dataset, opt, save_submission_filename, criterion)
-    logger.info("metrics_no_nms {}".format(pprint.pformat(metrics["brief"], indent=4)))
+    submission_path = os.path.join(opt.results_dir, f"submission_{opt.eval_split_name}.jsonl")
+    save_jsonl(submission, submission_path)
+
+    if load_labels:
+        metrics = eval_submission(submission, eval_dataset.data)
+        metrics_path = submission_path.replace(".jsonl", "_metrics.json")
+        save_json(metrics, metrics_path, save_pretty=True, sort_keys=False)
+        logger.info("metrics:\n{}".format(pprint.pformat(dict(metrics["brief"]), indent=2)))
+    else:
+        logger.info(f"Submission saved to {submission_path}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', '-c', type=str, required=True, help='config path')
-    parser.add_argument('--model_path', '-m', type=str, required=True, help='model checkpoint path')
-    parser.add_argument('--split', '-s', type=str, default='val', choices=['val', 'test'], help='split name: val or test')
+    parser.add_argument('--config', '-c', type=str, required=True)
+    parser.add_argument('--model_path', '-m', type=str, required=True)
+    parser.add_argument('--split', '-s', type=str, default='val', choices=['val', 'test'])
     args = parser.parse_args()
-    option_manager = BaseOptions(args.config)
-    option_manager.parse()
-    opt = option_manager.option
 
-    opt.model_path = args.model_path
+    config_path = os.path.abspath(args.config)
+    model_path = os.path.abspath(args.model_path)
+    os.chdir(os.path.dirname(config_path))
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    opt = EasyDict(cfg)
+    opt.model_path = model_path
     opt.eval_split_name = args.split
+    opt.max_v_l = opt.max_a_l
+    mkdirp(opt.results_dir)
+
     start_inference(opt)

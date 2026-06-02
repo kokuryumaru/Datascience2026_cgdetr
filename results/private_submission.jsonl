@@ -1,4 +1,0 @@
-{"qid": "dcase2026_evaluation_q001", "query": "Something entering the water", "duration": 60, "vid": "dcase2026_evaluation_audio_001", "pred_relevant_windows": [[0.000, 50.000]]}
-{"qid": "dcase2026_evaluation_q002", "query": "Heavy breathing", "duration": 150, "vid": "dcase2026_evaluation_audio_001", "pred_relevant_windows": [[10.000, 35.000]]}
-{"qid": "dcase2026_evaluation_q003", "query": "A man talking while the wind is blowing", "duration": 300, "vid": "dcase2026_evaluation_audio_002", "pred_relevant_windows": [[40.000, 45.000]]}
-{"qid": "dcase2026_evaluation_q004", "query": "Tapping glass with a mallet", "duration": 250, "vid": "dcase2026_evaluation_audio_003", "pred_relevant_windows": [[30.000, 50.000]]}
