@@ -51,6 +51,7 @@ def compute_mr_results(model, eval_loader, opt):
             mr_res.append(dict(
                 qid=meta["qid"], query=meta["query"], vid=meta["vid"],
                 pred_relevant_windows=cur_ranked_preds,
+                pred_saliency_scores=saliency_scores[idx],
             ))
 
     post_processor = PostProcessorDETR(

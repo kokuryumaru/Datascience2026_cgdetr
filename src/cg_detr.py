@@ -362,6 +362,8 @@ class CGDETR(nn.Module):
 
         txt_mem = memory[:, src_vid.shape[1]:]  # (bsz, L_txt, d)
         vid_mem = memory[:, :src_vid.shape[1]]  # (bsz, L_vid, d)
+        out["hs"] = hs[-1]       # (bs, num_queries, d) — for GLB loss
+        out["vid_mem"] = vid_mem  # (bs, L_vid, d)     — for GLB loss
 
         if vid is not None: ## for demo (run_on_video/run.py)
             ### Neg Pairs ###
@@ -901,6 +903,58 @@ class SetCriterion(nn.Module):
         loss_dummy_ortho += global_tokens_sim.abs().mean()
         return {"loss_orthogonal_dummy": loss_dummy_ortho}
 
+    def loss_glb(self, outputs, targets, indices, log=True):
+        """Sim-DETR Global-Local Bridging Loss.
+
+        For each matched (query, gt span) pair, maximize cosine similarity
+        between the query and frames inside the GT moment (InfoNCE-style).
+        """
+        if "hs" not in outputs or "vid_mem" not in outputs or indices is None:
+            return {"loss_glb": outputs["pred_spans"].new_zeros([])}
+
+        hs = outputs["hs"]            # (bs, num_queries, d)
+        vid_mem = outputs["vid_mem"]  # (bs, L_vid, d)
+        video_mask = outputs.get("video_mask", None)
+        L_vid = vid_mem.shape[1]
+
+        hs_norm = F.normalize(hs, dim=-1)
+        vid_norm = F.normalize(vid_mem, dim=-1)
+        sim = torch.bmm(hs_norm, vid_norm.transpose(1, 2))  # (bs, Nq, L_vid)
+
+        tau = getattr(self.args, 'glb_tau', 0.07)
+        sim = sim / tau
+
+        if video_mask is not None:
+            sim = sim.masked_fill(~video_mask.bool().unsqueeze(1), -1e9)
+
+        span_labels = targets["span_labels"]
+        losses_list = []
+
+        for b, (src_idx, tgt_idx) in enumerate(indices):
+            for qi, ti in zip(src_idx.tolist(), tgt_idx.tolist()):
+                span = span_labels[b]['spans'][ti]  # (cx, w) in [0, 1]
+                cx, w = float(span[0]), float(span[1])
+                start = int(max(0, (cx - w / 2) * L_vid))
+                end = int(min(L_vid, (cx + w / 2) * L_vid))
+                if end <= start:
+                    continue
+
+                sim_q = sim[b, qi]
+                mask_pos = torch.zeros(L_vid, dtype=torch.bool, device=sim_q.device)
+                mask_pos[start:end] = True
+                if video_mask is not None:
+                    mask_pos = mask_pos & video_mask[b].bool()
+                if mask_pos.sum() == 0:
+                    continue
+
+                log_denom = torch.logsumexp(sim_q, dim=0)
+                log_numer = torch.logsumexp(sim_q[mask_pos], dim=0)
+                losses_list.append(log_denom - log_numer)
+
+        if not losses_list:
+            return {"loss_glb": hs.new_zeros([])}
+        return {"loss_glb": torch.stack(losses_list).mean()}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -920,7 +974,8 @@ class SetCriterion(nn.Module):
             "saliency": self.loss_saliency,
             "ms_align": self.loss_contrastive_moment_sentence,
             "distill": self.loss_moment2txt_sim_distill,
-            "orthogonal_dummy":self.loss_orthogonal_dummy
+            "orthogonal_dummy":self.loss_orthogonal_dummy,
+            "glb": self.loss_glb,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, **kwargs)
@@ -968,6 +1023,8 @@ class SetCriterion(nn.Module):
                     if "distill" == loss:
                         continue
                     if "orthogonal_dummy" == loss:
+                        continue
+                    if "glb" == loss:  # GLB uses last-layer hs only
                         continue
                     kwargs = {}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, **kwargs)
@@ -1043,13 +1100,20 @@ def build_model(args):
                    "loss_distill": args.lw_distill,
                    "loss_orthogonal_dummy":args.lw_distill}
 
+    lw_glb = getattr(args, 'lw_glb', 0.0)
+    if lw_glb > 0:
+        weight_dict["loss_glb"] = lw_glb
+
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items() if k != "loss_saliency"})
+            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()
+                                    if k not in ("loss_saliency", "loss_glb")})
         weight_dict.update(aux_weight_dict)
 
     losses = ['spans', 'labels', 'saliency', 'ms_align', 'distill', 'orthogonal_dummy']
+    if lw_glb > 0:
+        losses.append('glb')
 
     criterion = SetCriterion(
         matcher=matcher, weight_dict=weight_dict, losses=losses,

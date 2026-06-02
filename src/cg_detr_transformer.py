@@ -164,7 +164,11 @@ class Transformer(nn.Module):
                                           return_intermediate=return_intermediate_dec,
                                           d_model=d_model, query_dim=query_dim, keep_query_pos=keep_query_pos, query_scale_type=query_scale_type,
                                           modulate_t_attn=modulate_t_attn,
-                                          bbox_embed_diff_each_layer=bbox_embed_diff_each_layer)
+                                          bbox_embed_diff_each_layer=bbox_embed_diff_each_layer,
+                                          qgr_enabled=getattr(args, 'qgr_enabled', False),
+                                          qgr_beta=getattr(args, 'qgr_beta', 0.1),
+                                          qgr_sigma=getattr(args, 'qgr_sigma', 0.1),
+                                          nhead=nhead)
 
         self._reset_parameters()
 
@@ -365,6 +369,7 @@ class TransformerDecoder(nn.Module):
                  d_model=256, query_dim=2, keep_query_pos=False, query_scale_type='cond_elewise',
                  modulate_t_attn=False,
                  bbox_embed_diff_each_layer=False,
+                 qgr_enabled=False, qgr_beta=0.1, qgr_sigma=0.1, nhead=8,
                  ):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -404,6 +409,10 @@ class TransformerDecoder(nn.Module):
         self.d_model = d_model
         self.modulate_t_attn = modulate_t_attn
         self.bbox_embed_diff_each_layer = bbox_embed_diff_each_layer
+        self.qgr_enabled = qgr_enabled
+        self.qgr_beta = qgr_beta
+        self.qgr_sigma = qgr_sigma
+        self.nhead = nhead
 
         if modulate_t_attn:
             self.ref_anchor_head = MLP(d_model, d_model, 1, 2)
@@ -451,7 +460,21 @@ class TransformerDecoder(nn.Module):
                 query_sine_embed *= (reft_cond[..., 0] / obj_center[..., 1]).unsqueeze(-1)
 
 
-            output = layer(output, memory, tgt_mask=tgt_mask,
+            # Sim-DETR QGR: penalize self-attn between queries with close predicted centers
+            layer_tgt_mask = tgt_mask
+            if self.qgr_enabled:
+                nq = reference_points.shape[0]
+                bs = reference_points.shape[1]
+                centers = reference_points[..., 0]  # (Nq, bs)
+                diff = (centers.unsqueeze(0) - centers.unsqueeze(1)).abs()  # (Nq, Nq, bs)
+                closeness = torch.exp(-diff / max(self.qgr_sigma, 1e-6))
+                qgr_penalty = -self.qgr_beta * closeness  # (Nq, Nq, bs)
+                qgr_mask = qgr_penalty.permute(2, 0, 1).contiguous()  # (bs, Nq, Nq)
+                qgr_mask = qgr_mask.unsqueeze(1).expand(-1, self.nhead, -1, -1)
+                qgr_mask = qgr_mask.reshape(bs * self.nhead, nq, nq)
+                layer_tgt_mask = qgr_mask if tgt_mask is None else tgt_mask + qgr_mask
+
+            output = layer(output, memory, tgt_mask=layer_tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
