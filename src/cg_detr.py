@@ -93,11 +93,9 @@ from misc import accuracy
 import numpy as np
 import copy
 
-def inverse_sigmoid(x, eps=1e-3):
-    x = x.clamp(min=0, max=1)
-    x1 = x.clamp(min=eps)
-    x2 = (1 - x).clamp(min=eps)
-    return torch.log(x1/x2)
+def inverse_sigmoid(x, eps=1e-5):
+    x = x.float().clamp(min=0.0, max=1.0)
+    return torch.logit(x, eps=eps)
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -154,7 +152,11 @@ class CGDETR(nn.Module):
         super().__init__()
         self.args=args
         self.num_queries = num_queries
-        self.transformer = transformer
+        # self.transformer = transformer
+        self.transformer = torch.compile(
+            transformer, 
+            backend="inductor", mode="default", dynamic=True
+        )
         self.position_embed = position_embed
         self.txt_position_embed = txt_position_embed
         hidden_dim = transformer.d_model
@@ -205,6 +207,16 @@ class CGDETR(nn.Module):
         scls_encoder_layer = TransformerEncoderLayer(hidden_dim, 8, self.args.dim_feedforward, 0.1, "prelu", normalize_before)
         scls_encoder_norm = nn.LayerNorm(hidden_dim) if normalize_before else None
         self.scls_encoder = TransformerEncoder(scls_encoder_layer, args.sent_layers, scls_encoder_norm)
+
+        # Registerトークンの定義 (例: args.num_registers で数を指定)
+        self.num_registers = args.num_registers
+        if self.num_registers > 0:
+            # 1. 空のテンソルを作成
+            self.register_tokens = nn.Parameter(torch.empty(self.num_registers, 1, args.hidden_dim))
+            # 2. ViTの標準である std=0.02 の正規分布で初期化し、対称性を破る
+            nn.init.normal_(self.register_tokens, std=0.02)
+        else:
+            self.register_tokens = None
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, vid, qid, src_aud=None, src_aud_mask=None, targets=None):
         """The forward expects two tensors:
@@ -326,14 +338,20 @@ class CGDETR(nn.Module):
 
             txt_dummy_proj = torch.cat([smemory_words_dummy, smemory_words], dim=0)
 
-            hs, reference, memory, memory_global, attn_weights, memory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames = self.transformer(src, ~mask, self.query_embed.weight, pos, video_length=video_length, moment_idx=targets["relevant_clips"], msrc=msrc, mpos=mpos, mmask=~mmask, nmsrc=nmsrc, nmpos=nmpos, nmmask=~nmmask,
-                                                                                                                  ctxtoken=vidsrc_, gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask.sum(1).long())
+            hs, reference, memory, memory_global, attn_weights, memory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames = self.transformer(
+                src, ~mask, self.query_embed.weight, pos, video_length=video_length, moment_idx=targets["relevant_clips"], msrc=msrc, mpos=mpos, mmask=~mmask, nmsrc=nmsrc, nmpos=nmpos, nmmask=~nmmask,
+                ctxtoken=vidsrc_, gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask.sum(1).long(), 
+                register_tokens=self.register_tokens
+            )
             moment2txt_similarity = torch.matmul(mmemory_frames.permute(1, 0, 2), txt_dummy_proj.permute(1, 2, 0))
             nmoment2txt_similarity = torch.matmul(nmmemory_frames.permute(1, 0, 2), txt_dummy_proj.permute(1, 2, 0))
         else: ## inference
             sentence_dummy, sentence_txt, moment2txt_similarity, nmoment2txt_similarity = None, None, None, None
-            hs, reference, memory, memory_global, attn_weights, memory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames = self.transformer(src, ~mask, self.query_embed.weight, pos, video_length=video_length,
-                                                                                                                  ctxtoken=vidsrc_, gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask.sum(1).long())
+            hs, reference, memory, memory_global, attn_weights, memory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames = self.transformer(
+                src, ~mask, self.query_embed.weight, pos, video_length=video_length,
+                ctxtoken=vidsrc_, gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask.sum(1).long(),
+                register_tokens=self.register_tokens
+            )
         outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
         reference_before_sigmoid = inverse_sigmoid(reference)
         tmp = self.span_embed(hs)
@@ -363,8 +381,11 @@ class CGDETR(nn.Module):
                 pos_neg = pos_neg[real_neg_mask]
                 src_txt_mask_dummy_neg = src_txt_mask_dummy_neg[real_neg_mask]
 
-                _, _, memory_neg, memory_global_neg, attn_weights_neg, _, _, _, _ = self.transformer(src_dummy_neg, ~mask_dummy_neg, self.query_embed.weight, pos_neg, video_length=video_length,
-                                                                                               ctxtoken=vidsrc_[real_neg_mask], gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask[real_neg_mask].sum(1).long())
+                _, _, memory_neg, memory_global_neg, attn_weights_neg, _, _, _, _ = self.transformer(
+                    src_dummy_neg, ~mask_dummy_neg, self.query_embed.weight, pos_neg, video_length=video_length,
+                    ctxtoken=vidsrc_[real_neg_mask], gtoken=self.global_rep_token, gpos=self.global_rep_pos, vlen=src_vid_mask[real_neg_mask].sum(1).long(),
+                    register_tokens=self.register_tokens
+                )
                 vid_mem_neg = memory_neg[:, :src_vid.shape[1]]
                 out["saliency_scores_neg"] = (torch.sum(self.saliency_proj1(vid_mem_neg) * self.saliency_proj2(memory_global_neg).unsqueeze(1), dim=-1) / np.sqrt(self.hidden_dim))
                 out["src_txt_mask_neg"] = src_txt_mask_dummy_neg
@@ -1030,14 +1051,11 @@ def build_model(args):
 
     losses = ['spans', 'labels', 'saliency', 'ms_align', 'distill', 'orthogonal_dummy']
 
-    # For highlight detection datasets
-    use_matcher = not (args.dset_name in ['youtube_highlight', 'tvsum'])
-
     criterion = SetCriterion(
         matcher=matcher, weight_dict=weight_dict, losses=losses,
         eos_coef=args.eos_coef, span_loss_type=args.span_loss_type,
         max_v_l=args.max_v_l, saliency_margin=args.saliency_margin, 
-        use_matcher=use_matcher, args=args)
+        use_matcher=True, args=args)
     criterion.to(device)
 
     return model, criterion
