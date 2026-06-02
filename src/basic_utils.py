@@ -65,8 +65,10 @@ def write_log(opt, epoch_i, loss_meters, metrics=None, mode='train'):
         f.write(to_write)
 
 def save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt):
+    state_dict = model.state_dict()
+    clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
     checkpoint = {
-        "model": model.state_dict(),
+        "model": clean_state_dict,
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
         "epoch": epoch_i,

@@ -14,6 +14,11 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from easydict import EasyDict
+torch.set_float32_matmul_precision('high')
+import torch.backends.cuda
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 from dataset import CGDETR_StartEndDataset, cg_detr_start_end_collate, cg_detr_prepare_batch_inputs
 from cg_detr import build_model
@@ -39,13 +44,47 @@ def set_seed(seed):
 
 def setup_model(opt):
     model, criterion = build_model(opt)
+
     if opt.device == "cuda":
         logger.info("CUDA enabled.")
         model.to(opt.device)
         criterion.to(opt.device)
-    param_dicts = [{"params": [p for n, p in model.named_parameters() if p.requires_grad]}]
-    optimizer = torch.optim.AdamW(param_dicts, lr=opt.lr, weight_decay=opt.wd)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, opt.lr_drop)
+    
+    # ---------------------------------------------------------
+    # パラメータのグループ分け（BiasとLayerNormを減衰から除外）
+    # ---------------------------------------------------------
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 1次元テンソル、名前に"bias"や"norm"が含まれるパラメータは減衰させない
+        if param.ndim <= 1 or name.endswith(".bias") or "norm" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    # グループごとに weight_decay の値を指定
+    param_dicts = [
+        {"params": decay_params, "weight_decay": float(opt.wd)},
+        {"params": no_decay_params, "weight_decay": 0.0}
+    ]
+    optimizer = torch.optim.AdamW(param_dicts, lr=float(opt.lr), fused=True)
+
+    # ---------------------------------------------------------
+    # 学習率スケジューラ (Warmup + CosineDecay)
+    # ---------------------------------------------------------
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, total_iters=opt.warmup_epochs
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=(opt.n_epoch - opt.warmup_epochs), eta_min=float(opt.eta_min)
+    )
+    lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[opt.warmup_epochs] # このエポック数でスケジューラを切り替え
+    )
     return model, criterion, optimizer, lr_scheduler
 
 
@@ -67,7 +106,8 @@ def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filenam
 @torch.no_grad()
 def compute_mr_results(model, eval_loader, opt):
     mr_res = []
-    for batch in tqdm(eval_loader, desc="compute st ed scores"):
+    for batch in tqdm(eval_loader, desc="compute st ed scores", 
+                      bar_format='{percentage:3.0f}% | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
         query_meta = batch[0]
         model_inputs, targets = cg_detr_prepare_batch_inputs(batch[1], opt.device)
         outputs = model(**model_inputs, targets=targets)
@@ -101,13 +141,16 @@ def compute_mr_results(model, eval_loader, opt):
 
 
 def eval_epoch(model, val_dataset, opt, save_submission_filename, criterion=None):
-    logger.info("Generate submissions")
+    # logger.info("Generate submissions")
     model.eval()
     if criterion is not None:
         criterion.eval()
     eval_loader = DataLoader(
         val_dataset, collate_fn=cg_detr_start_end_collate,
-        batch_size=opt.eval_bsz, num_workers=opt.num_workers, shuffle=False,
+        batch_size=opt.eval_bsz, shuffle=False,
+        num_workers=opt.num_workers, pin_memory=True,
+        persistent_workers=(opt.num_workers > 0),
+        prefetch_factor=2 if opt.num_workers > 0 else None
     )
     submission = compute_mr_results(model, eval_loader, opt)
     return eval_epoch_post_processing(submission, opt, val_dataset.data, save_submission_filename)
@@ -118,12 +161,13 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
     model.train()
     criterion.train()
     loss_meters = defaultdict(AverageMeter)
-    for batch in tqdm(train_loader, desc="Training"):
+    for batch in tqdm(train_loader, desc="Training", 
+                      bar_format='{percentage:3.0f}% | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
         model_inputs, targets = cg_detr_prepare_batch_inputs(batch[1], opt.device)
         outputs = model(**model_inputs, targets=targets)
         loss_dict = criterion(outputs, targets)
         losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict if k in criterion.weight_dict)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         losses.backward()
         if opt.grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
@@ -140,27 +184,51 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
     save_submission_filename = f"latest_{opt.dset_name}_val_preds.jsonl"
     train_loader = DataLoader(
         train_dataset, collate_fn=cg_detr_start_end_collate,
-        batch_size=opt.bsz, num_workers=opt.num_workers, shuffle=True,
+        batch_size=opt.bsz, shuffle=True,
+        num_workers=opt.num_workers, pin_memory=True,
+        persistent_workers=(opt.num_workers > 0),
+        prefetch_factor=2 if opt.num_workers > 0 else None
     )
     if opt.model_ema:
         logger.info("Using model EMA...")
         model_ema = ModelEMA(model, decay=opt.ema_decay)
 
-    prev_best_score = 0.
+    prev_best_r1_07 = 0.0
+    prev_best_r1_05 = 0.0
     for epoch_i in trange(opt.n_epoch, desc="Epoch"):
         train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i)
         lr_scheduler.step()
+
         if opt.model_ema:
-            model_ema.update(model)
+            # configから開始エポックを取得（設定がなければ0から開始）
+            ema_start_epoch = getattr(opt, 'ema_start_epoch', 0)
+            if epoch_i < ema_start_epoch:
+                # 序盤：モデルの重みをそのままEMAモデルに上書きコピー（平均化しない）
+                model_ema.module.load_state_dict(model.state_dict())
+            else:
+                # 指定エポック以降：通常の指数移動平均（EMA）による更新
+                model_ema.update(model)
+        
         if (epoch_i + 1) % opt.eval_epoch_interval == 0:
             with torch.no_grad():
                 eval_model = model_ema.module if opt.model_ema else model
                 metrics, latest_file_paths = eval_epoch(eval_model, val_dataset, opt, save_submission_filename, criterion)
             write_log(opt, epoch_i, defaultdict(AverageMeter), metrics=metrics, mode='val')
-            logger.info("metrics {}".format(pprint.pformat(metrics["brief"], indent=4)))
-            stop_score = metrics["brief"]["MR-full-mAP"]
-            if stop_score > prev_best_score:
-                prev_best_score = stop_score
+            logger.info("metrics:\n{}".format(pprint.pformat(dict(metrics["brief"]), indent=2)))
+            # 評価指標の取得・ベストモデル更新
+            current_r1_07 = metrics["brief"]["MR-full-R1@0.7"]
+            current_r1_05 = metrics["brief"]["MR-full-R1@0.5"]
+            # 更新の判定
+            is_best = False
+            if current_r1_07 > prev_best_r1_07:
+                is_best = True
+            elif current_r1_07 == prev_best_r1_07:
+                if current_r1_05 > prev_best_r1_05:
+                    is_best = True
+            # ベストモデルの保存処理
+            if is_best:
+                prev_best_r1_07 = current_r1_07
+                prev_best_r1_05 = current_r1_05
                 save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt)
                 logger.info("The checkpoint file has been updated.")
                 rename_latest_to_best(latest_file_paths)
@@ -190,10 +258,17 @@ def main(opt, resume=None):
         max_windows=opt.max_windows,
         span_loss_type=opt.span_loss_type,
         load_labels=True,
+        # === 追加：時間シフト用の設定 ===
+        is_train=True,
+        shift_prob=getattr(opt, "shift_prob", 0.0),
+        margin_frames=getattr(opt, "margin_frames", 3),
     )
     train_dataset = CGDETR_StartEndDataset(**dataset_config)
+    # 検証（Validation）用データセットの設定
     eval_config = copy.deepcopy(dataset_config)
     eval_config.data_path = opt.val_path
+    # === 追加：検証時は時間シフトを無効化（False） ===
+    eval_config.is_train = False 
     val_dataset = CGDETR_StartEndDataset(**eval_config)
 
     model, criterion, optimizer, lr_scheduler = setup_model(opt)
@@ -202,7 +277,17 @@ def main(opt, resume=None):
 
     if resume is not None:
         checkpoint = torch.load(resume, weights_only=False)
-        model.load_state_dict(checkpoint["model"])
+        loaded_state_dict = checkpoint['model']
+        model_state_dict = model.state_dict()
+        adapted_state_dict = {}
+        for k, v in loaded_state_dict.items():
+            clean_k = k.replace('_orig_mod.', '')
+            compiled_k = clean_k.replace('transformer.', 'transformer._orig_mod.')
+            if compiled_k in model_state_dict:
+                adapted_state_dict[compiled_k] = v
+            else:
+                adapted_state_dict[clean_k] = v
+        model.load_state_dict(adapted_state_dict)
         logger.info(f"Loaded checkpoint: {resume}")
 
     logger.info("Start Training...")
