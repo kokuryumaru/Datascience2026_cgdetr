@@ -1,3 +1,44 @@
+"""
+Copyright $today.year LY Corporation
+
+LY Corporation licenses this file to you under the Apache License,
+version 2.0 (the "License"); you may not use this file except in compliance
+with the License. You may obtain a copy of the License at:
+
+  https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations
+under the License.
+
+Moment-DETR (https://github.com/jayleicn/moment_detr)
+Copyright (c) 2021 Jie Lei
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+Modules to compute the matching cost and solve the corresponding LSAP.
+"""
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
@@ -12,13 +53,8 @@ class HungarianMatcher(nn.Module):
     there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
     while the others are un-matched (and thus treated as non-objects).
     """
-    def __init__(
-        self,
-        cost_class: float = 1,
-        cost_span: float = 1,
-        cost_giou: float = 1,
-        span_loss_type: str = "l1",
-        max_a_l: int = 75):
+    def __init__(self,  cost_class: float = 1, cost_span: float = 1, cost_giou: float = 1,
+                 span_loss_type: str = "l1", max_v_l: int = 75):
         """Creates the matcher
 
         Params:
@@ -30,7 +66,7 @@ class HungarianMatcher(nn.Module):
         self.cost_span = cost_span
         self.cost_giou = cost_giou
         self.span_loss_type = span_loss_type
-        self.max_a_l = max_a_l
+        self.max_v_l = max_v_l
         self.foreground_label = 0
         assert cost_class != 0 or cost_span != 0 or cost_giou != 0, "all costs cant be 0"
 
@@ -170,18 +206,13 @@ class HungarianEventMatcher(nn.Module):
 
 def build_matcher(args):
     return HungarianMatcher(
-        cost_span=args.set_cost_span,
-        cost_giou=args.set_cost_giou,
-        cost_class=args.set_cost_class,
-        span_loss_type=args.span_loss_type,
-        max_a_l=args.max_a_l
+        cost_span=args.set_cost_span, cost_giou=args.set_cost_giou,
+        cost_class=args.set_cost_class, span_loss_type=args.span_loss_type, max_v_l=args.max_v_l
     )
 
 
 def build_event_matcher(args):
     return HungarianEventMatcher(
-        cost_span=args.set_cost_span,
-        cost_giou=args.set_cost_giou,
-        span_loss_type=args.span_loss_type,
-        max_a_l=args.max_a_l
+        cost_span=args.set_cost_span, cost_giou=args.set_cost_giou,
+        span_loss_type=args.span_loss_type, max_v_l=args.max_v_l
     )
