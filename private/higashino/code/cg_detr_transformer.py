@@ -166,7 +166,11 @@ class Transformer(nn.Module):
                                           return_intermediate=return_intermediate_dec,
                                           d_model=d_model, query_dim=query_dim, keep_query_pos=keep_query_pos, query_scale_type=query_scale_type,
                                           modulate_t_attn=modulate_t_attn,
-                                          bbox_embed_diff_each_layer=bbox_embed_diff_each_layer)
+                                          bbox_embed_diff_each_layer=bbox_embed_diff_each_layer,
+                                          qgr_enabled=getattr(args, 'qgr_enabled', False),
+                                          qgr_beta=getattr(args, 'qgr_beta', 0.1),
+                                          qgr_sigma=getattr(args, 'qgr_sigma', 0.1),
+                                          nhead=nhead)
 
         self._reset_parameters()
 
@@ -349,6 +353,7 @@ class TransformerDecoder(nn.Module):
                  d_model=256, query_dim=2, keep_query_pos=False, query_scale_type='cond_elewise',
                  modulate_t_attn=False,
                  bbox_embed_diff_each_layer=False,
+                 qgr_enabled=False, qgr_beta=0.1, qgr_sigma=0.1, nhead=8,
                  ):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
@@ -357,6 +362,12 @@ class TransformerDecoder(nn.Module):
         self.return_intermediate = return_intermediate
         assert return_intermediate
         self.query_dim = query_dim
+        # Sim-DETR QGR (Query Group Restriction) — penalize self-attn between queries
+        # whose predicted centers are close in time (prevents query collapse).
+        self.qgr_enabled = qgr_enabled
+        self.qgr_beta = qgr_beta
+        self.qgr_sigma = qgr_sigma
+        self.nhead = nhead
 
         assert query_scale_type in ['cond_elewise', 'cond_scalar', 'fix_elewise']
         self.query_scale_type = query_scale_type
@@ -434,8 +445,25 @@ class TransformerDecoder(nn.Module):
 
                 query_sine_embed *= (reft_cond[..., 0] / obj_center[..., 1]).unsqueeze(-1)
 
+            # Sim-DETR QGR: build an additive penalty on the decoder self-attn
+            # that discourages queries with close predicted centers from attending
+            # to each other (= prevents query collapse to the same time region).
+            layer_tgt_mask = tgt_mask
+            if self.qgr_enabled:
+                nq, bs = reference_points.shape[0], reference_points.shape[1]
+                centers = reference_points[..., 0]  # (Nq, bs), in [0,1]
+                d = (centers.unsqueeze(0) - centers.unsqueeze(1)).abs()  # (Nq, Nq, bs)
+                closeness = torch.exp(-d / max(self.qgr_sigma, 1e-6))  # high when close
+                qgr_penalty = -self.qgr_beta * closeness  # (Nq, Nq, bs)
+                qgr_mask = qgr_penalty.permute(2, 0, 1).contiguous()  # (bs, Nq, Nq)
+                qgr_mask = qgr_mask.unsqueeze(1).expand(-1, self.nhead, -1, -1)
+                qgr_mask = qgr_mask.reshape(bs * self.nhead, nq, nq)
+                if tgt_mask is None:
+                    layer_tgt_mask = qgr_mask
+                else:
+                    layer_tgt_mask = tgt_mask + qgr_mask
 
-            output = layer(output, memory, tgt_mask=tgt_mask,
+            output = layer(output, memory, tgt_mask=layer_tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
