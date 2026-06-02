@@ -6,6 +6,7 @@ import argparse
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
+torch.set_float32_matmul_precision('high')
 from easydict import EasyDict
 from tqdm import tqdm
 
@@ -26,7 +27,8 @@ logging.basicConfig(format="%(asctime)s.%(msecs)03d:%(levelname)s:%(name)s - %(m
 @torch.no_grad()
 def compute_mr_results(model, eval_loader, opt):
     mr_res = []
-    for batch in tqdm(eval_loader, desc="compute st ed scores"):
+    for batch in tqdm(eval_loader, desc="compute st ed scores", 
+                      bar_format='{percentage:3.0f}% | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
         query_meta = batch[0]
         model_inputs, targets = cg_detr_prepare_batch_inputs(batch[1], opt.device)
         outputs = model(**model_inputs, targets=targets)
@@ -62,7 +64,7 @@ def compute_mr_results(model, eval_loader, opt):
 def start_inference(opt):
     logger.info("Setup config, data and model...")
     cudnn.benchmark = True
-    load_labels = opt.eval_split_name == 'val'
+    load_labels = opt.eval_split_name in ['val', 'test']
 
     data_path = opt.val_path if opt.eval_split_name == 'val' else opt.test_path
     dataset_config = EasyDict(
@@ -91,7 +93,17 @@ def start_inference(opt):
         logger.info("CUDA enabled.")
         model.to(opt.device)
     checkpoint = torch.load(opt.model_path, weights_only=False)
-    model.load_state_dict(checkpoint["model"])
+    loaded_state_dict = checkpoint['model']
+    model_state_dict = model.state_dict()
+    adapted_state_dict = {}
+    for k, v in loaded_state_dict.items():
+        clean_k = k.replace('_orig_mod.', '')
+        compiled_k = clean_k.replace('transformer.', 'transformer._orig_mod.')
+        if compiled_k in model_state_dict:
+            adapted_state_dict[compiled_k] = v
+        else:
+            adapted_state_dict[clean_k] = v
+    model.load_state_dict(adapted_state_dict)
     logger.info(f"Model checkpoint: {opt.model_path}")
     model.eval()
 
@@ -110,7 +122,7 @@ def start_inference(opt):
         metrics = eval_submission(submission, eval_dataset.data)
         metrics_path = submission_path.replace(".jsonl", "_metrics.json")
         save_json(metrics, metrics_path, save_pretty=True, sort_keys=False)
-        logger.info("metrics {}".format(pprint.pformat(metrics["brief"], indent=4)))
+        logger.info("metrics:\n{}".format(pprint.pformat(dict(metrics["brief"]), indent=2)))
     else:
         logger.info(f"Submission saved to {submission_path}")
 

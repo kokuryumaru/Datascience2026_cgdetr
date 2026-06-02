@@ -2,16 +2,22 @@
 # Usage:
 #   cd /data/kokuryumaru/lighthouse-cgdetr/src
 #   python train.py --config ../config_pretraining.yml
+# === Registerトークン用の設定 ===
+num_registers: 0        # 追加するRegisterトークンの数
+# === 追加：時間シフト用の設定 ===
+shift_prob: 0.8         # シフトを適用する確率 (0.0 〜 1.0)
+margin_frames: 3        # 前後に残す最小マージン（フレーム数）
 
 seed: 2023
 device: 'cuda'
-num_workers: 4
+num_workers: 8
 model_name: cg_detr
 
-lr: 0.0001
-lr_drop: 100
-wd: 0.0001
-n_epoch: 100
+lr: 1e-4
+wd: 1e-4
+warmup_epochs: 10
+n_epoch: 200
+eta_min: 1e-6
 bsz: 32
 eval_bsz: 100
 grad_clip: 0.1
@@ -64,7 +70,8 @@ aux_loss: True
 
 # EMA
 model_ema: True
-ema_decay: 0.999
+ema_decay: 0.99
+ema_start_epoch: 25
 results_dir: results_pretraining
 
 # Dataset: Clotho-Moment

@@ -108,11 +108,9 @@ class MLP(nn.Module):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
-def inverse_sigmoid(x, eps=1e-3):
-    x = x.clamp(min=0, max=1)
-    x1 = x.clamp(min=eps)
-    x2 = (1 - x).clamp(min=eps)
-    return torch.log(x1/x2)
+def inverse_sigmoid(x, eps=1e-5):
+    x = x.float().clamp(min=0.0, max=1.0)
+    return torch.logit(x, eps=eps)
 
 def gen_sineembed_for_position(pos_tensor, d_model):
     # n_query, bs, _ = pos_tensor.size()
@@ -183,7 +181,7 @@ class Transformer(nn.Module):
 
     def forward(self, src, mask, query_embed, pos_embed, video_length=None, moment_idx=None, msrc=None, mpos=None, mmask=None,
                 nmsrc=None, nmpos=None, nmmask=None,
-                ctxtoken=None, gtoken=None, gpos=None, vlen=None):
+                ctxtoken=None, gtoken=None, gpos=None, vlen=None, register_tokens=None):
         """
         Args:
             src: (batch_size, L, d)
@@ -243,6 +241,7 @@ class Transformer(nn.Module):
             src_[i] = (topk_val[i].unsqueeze(1) * gtoken[topkidx[i]]).sum(0)
         src_ = src_.reshape(1, src.size(1), -1)
 
+
         ## Add context and distribution token
         src_ = src_ + ctx_src_
         pos_ = gpos.reshape([1, 1, self.d_model]).repeat(1, pos_embed.shape[1], 1)
@@ -251,19 +250,34 @@ class Transformer(nn.Module):
         src_, _ = self.t2v_encoder(src_, src_key_padding_mask=mask_, pos=pos_,
                                              video_length=video_length, dummy=False)  # (L, batch_size, d)
 
-        src = torch.cat([src_, t2v_src], dim=0)
-        mask = torch.cat([mask_, mask], dim=1)
-        pos_embed = torch.cat([pos_, pos_embed], dim=0)
+        # ----- Register トークンの結合 -----
+        if register_tokens is not None:
+            num_registers = register_tokens.size(0)
+            # register_tokens: (num_registers, 1, d) -> (num_registers, bs, d)
+            reg_src = register_tokens.expand(-1, bs, -1)
+            # Register用のmaskとpos_embed (位置情報はゼロベクトル、maskはFalse(有効))
+            reg_mask = torch.zeros((bs, num_registers), dtype=torch.bool, device=mask.device)
+            reg_pos = torch.zeros((num_registers, bs, d), dtype=src.dtype, device=src.device)
+            # [Saliency(1), Register(N), Video/Audio(L)] の順に結合
+            src = torch.cat([src_, reg_src, t2v_src], dim=0)
+            mask = torch.cat([mask_, reg_mask, mask], dim=1)
+            pos_embed = torch.cat([pos_, reg_pos, pos_embed], dim=0)
+            n_special = 1 + num_registers
+        else:
+            src = torch.cat([src_, t2v_src], dim=0)
+            mask = torch.cat([mask_, mask], dim=1)
+            pos_embed = torch.cat([pos_, pos_embed], dim=0)
+            n_special = 1
 
-        src = src[:video_length + 1]
-        mask = mask[:, :video_length + 1]
-        pos_embed = pos_embed[:video_length + 1]
+        src = src[:video_length + n_special]
+        mask = mask[:, :video_length + n_special]
+        pos_embed = pos_embed[:video_length + n_special]
 
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # (L, batch_size, d)
-        memory_global, memory_local = memory[0], memory[1:]
+        memory_global, memory_local = memory[0], memory[n_special:]
         memory_local += memory_global.unsqueeze(0).repeat(memory_local.size(0), 1, 1)
-        mask_local = mask[:, 1:]
-        pos_embed_local = pos_embed[1:]
+        mask_local = mask[:, n_special:]
+        pos_embed_local = pos_embed[n_special:]
 
         tgt = torch.zeros(refpoint_embed.shape[0], bs, d, device=src.device)
         hs, references = self.decoder(tgt, memory_local, memory_key_padding_mask=mask_local,
