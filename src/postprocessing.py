@@ -57,8 +57,7 @@ class PostProcessorDETR:
 
     def __call__(self, lines):
         processed_lines = []
-        for line in tqdm(lines, desc=f"convert to multiples of clip_length={self.clip_length}", 
-                         bar_format='{percentage:3.0f}% | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'):
+        for line in tqdm(lines, desc=f"convert to multiples of clip_length={self.clip_length}"):
             windows_and_scores = torch.tensor(line["pred_relevant_windows"])
             windows = windows_and_scores[:, :2]
             for func_name in self.process_func_names:

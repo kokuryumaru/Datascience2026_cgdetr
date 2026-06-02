@@ -1,52 +1,30 @@
-# Stage 2: Fine-tuning CG-DETR on CASTELLA
-# Usage:
-#   cd /data/kokuryumaru/lighthouse-cgdetr/src
-#   python train.py --config ../config.yml --resume ../results_pretraining/best.ckpt
-# === Registerトークン用の設定 ===
-num_registers: 0        # 追加するRegisterトークンの数
-# === 追加：時間シフト用の設定 ===
-shift_prob: 0.8         # シフトを適用する確率 (0.0 〜 1.0)
-margin_frames: 3        # 前後に残す最小マージン（フレーム数）
-
+# base config
 seed: 2023
 device: 'cuda'
-num_workers: 8
-model_name: cg_detr
+num_workers: 4
 
-lr: 1e-4
-wd: 1e-4
-warmup_epochs: 10
+lr: 0.0001
+lr_drop: 400
+wd: 0.0001
 n_epoch: 200
-eta_min: 1e-6
 bsz: 32
 eval_bsz: 100
 grad_clip: 0.1
-max_windows: 10
+max_windows: 5
 clip_length: 1
 eval_epoch_interval: 1
 
-# Transformer architecture
 position_embedding: "sine"
-enc_layers: 3
-dec_layers: 3
-t2v_layers: 2
-sent_layers: 1
-moment_layers: 1
-dummy_layers: 2
+enc_layers: 2
+dec_layers: 2
 dim_feedforward: 1024
 hidden_dim: 256
-input_dropout: 0.3
+input_dropout: 0.5
 dropout: 0.1
 nheads: 8
 num_queries: 10
+
 n_input_proj: 2
-
-# CG-DETR specific
-num_dummies: 45
-total_prompts: 10
-num_prompts: 2
-
-# Loss weights
 saliency_margin: 0.2
 span_loss_type: "l1"
 set_cost_span: 10
@@ -57,37 +35,36 @@ giou_loss_coef: 1
 label_loss_coef: 4
 eos_coef: 0.1
 lw_saliency: 1
-lw_wattn: 1
-lw_ms_align: 1
-lw_distill: 1
 
-# Checkpoint & logging
-ckpt_filename: best.ckpt
+ckpt_filename: best_checkpoint.pth
 train_log_filename: train.log
 eval_log_filename: val.log
 eval_split_name: val
 aux_loss: True
 
-# EMA
-model_ema: True
-ema_decay: 0.99
-ema_start_epoch: 25
+model_ema: False
+ema_decay: 0.9
 results_dir: results
 
-# Dataset: CASTELLA
+# castella-specific config
 dset_name: castella
+clip_length: 1
 train_path: data/castella_train_release.jsonl
 val_path: data/castella_val_release.jsonl
 test_path: data/castella_test_release.jsonl
+submission_path: private/dcase2026_private.jsonl
 max_q_l: 32
 max_a_l: 300
 
-# Features: CLAP (768-dim)
+# feature-specific config 
 ctx_mode: audio_tef
 a_feat_dir: features/castella/clap
 t_feat_dir: features/castella/clap_text
+a_sub_feat_dir: private/feature/clap
+t_sub_feat_dir: private/feature/clap_text
 a_feat_type: clap
 t_feat_type: clap
-v_feat_dim: 2
 a_feat_dim: 768
 t_feat_dim: 768
+
+model_name: qd_detr
