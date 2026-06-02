@@ -1,27 +1,26 @@
-# Stage 1: Pre-training CG-DETR on Clotho-Moment
+# Plan B: Cosine LR Annealing (without Sim-DETR)
+# Based on config.yml, with Sim-DETR disabled (qgr_enabled=false, lw_glb=0)
+# and Cosine LR scheduler enabled.
+#
+# Verified result: NOT effective for CG-DETR + CASTELLA (-1.78pt vs B-team baseline).
+# Kept for documentation and possible future tuning of lr_min.
+#
 # Usage:
-#   cd /data/kokuryumaru/lighthouse-cgdetr/src
-#   python train.py --config ../config_pretraining.yml
-# === Registerトークン用の設定 ===
-num_registers: 0        # 追加するRegisterトークンの数
-# === 追加：時間シフト用の設定 ===
-shift_prob: 0.8         # シフトを適用する確率 (0.0 〜 1.0)
-margin_frames: 3        # 前後に残す最小マージン（フレーム数）
+#   python train.py --config config_planB_cosine.yml --resume results_pretraining/best.ckpt
 
 seed: 2023
 device: 'cuda'
-num_workers: 8
+num_workers: 4
 model_name: cg_detr
 
-lr: 1e-4
-wd: 1e-4
-warmup_epochs: 10
-n_epoch: 200
-eta_min: 1e-6
+lr: 0.00005
+lr_drop: 100
+wd: 0.0001
+n_epoch: 100
 bsz: 32
 eval_bsz: 100
 grad_clip: 0.1
-max_windows: 5
+max_windows: 10
 clip_length: 1
 eval_epoch_interval: 1
 
@@ -35,7 +34,7 @@ moment_layers: 1
 dummy_layers: 2
 dim_feedforward: 1024
 hidden_dim: 256
-input_dropout: 0.5
+input_dropout: 0.3
 dropout: 0.1
 nheads: 8
 num_queries: 10
@@ -61,6 +60,17 @@ lw_wattn: 1
 lw_ms_align: 1
 lw_distill: 1
 
+# Sim-DETR disabled for Plan B
+qgr_enabled: false
+qgr_beta: 0.1
+qgr_sigma: 0.1
+lw_glb: 0
+glb_tau: 0.07
+
+# Plan B: Cosine LR Annealing
+lr_scheduler: cosine
+lr_min: 0.000001
+
 # Checkpoint & logging
 ckpt_filename: best.ckpt
 train_log_filename: train.log
@@ -70,22 +80,21 @@ aux_loss: True
 
 # EMA
 model_ema: True
-ema_decay: 0.99
-ema_start_epoch: 25
-results_dir: results_pretraining
+ema_decay: 0.999
+results_dir: results_planB_cosine
 
-# Dataset: Clotho-Moment
-dset_name: clotho-moment
-train_path: data/clotho_moment_train_release.jsonl
-val_path: data/clotho_moment_val_release.jsonl
-test_path: data/clotho_moment_test_release.jsonl
+# Dataset: CASTELLA
+dset_name: castella
+train_path: data/castella_train_release.jsonl
+val_path: data/castella_val_release.jsonl
+test_path: data/castella_test_release.jsonl
 max_q_l: 32
 max_a_l: 300
 
 # Features: CLAP (768-dim)
 ctx_mode: audio_tef
-a_feat_dir: features/clotho-moment/clap
-t_feat_dir: features/clotho-moment/clap_text
+a_feat_dir: features/castella/clap
+t_feat_dir: features/castella/clap_text
 a_feat_type: clap
 t_feat_type: clap
 v_feat_dim: 2

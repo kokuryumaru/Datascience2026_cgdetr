@@ -135,11 +135,9 @@ class global_fusion(nn.Module):
         return src
 
 
-def inverse_sigmoid(x, eps=1e-3):
-    x = x.clamp(min=0, max=1)
-    x1 = x.clamp(min=eps)
-    x2 = (1 - x).clamp(min=eps)
-    return torch.log(x1/x2)
+def inverse_sigmoid(x, eps=1e-5):
+    x = x.float().clamp(min=0.0, max=1.0)
+    return torch.logit(x, eps=eps)
 
 
 class MLP(nn.Module):
@@ -155,13 +153,6 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
-
-
-def inverse_sigmoid(x, eps=1e-3):
-    x = x.clamp(min=0, max=1)
-    x1 = x.clamp(min=eps)
-    x2 = (1 - x).clamp(min=eps)
-    return torch.log(x1/x2)
 
 
 def gen_sineembed_for_position(pos_tensor):
