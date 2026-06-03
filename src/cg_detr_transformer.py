@@ -178,6 +178,10 @@ class Transformer(nn.Module):
         self.num_queries = num_queries
         self.num_patterns = num_patterns
 
+        self.refine_mlp = MLP(input_dim=d_model, hidden_dim=d_model, output_dim=d_model, num_layers=3)
+        nn.init.constant_(self.refine_mlp.layers[-1].weight.data, 0)
+        nn.init.constant_(self.refine_mlp.layers[-1].bias.data, 0)
+
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
@@ -288,6 +292,7 @@ class Transformer(nn.Module):
                           pos=pos_embed_local, refpoints_unsigmoid=refpoint_embed)  # (#layers, #queries, batch_size, d)
         memory_local = memory_local.transpose(0, 1)  # (batch_size, L, d)
 
+        hs = hs + self.refine_mlp(hs)
         return hs, references, memory_local, memory_global, attn_weights, mmemory_moment, nmmemory_moment, mmemory_frames, nmmemory_frames
 
 

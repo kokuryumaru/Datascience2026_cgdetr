@@ -341,7 +341,7 @@ def eval_submission(submission, ground_truth, verbose=True, match_number=True):
         eval_metrics_brief.update(
             sorted([(k, v) for k, v in moment_ret_scores_brief.items()], key=lambda x: x[0]))
 
-    if "pred_saliency_scores" in submission[0]:
+    if "pred_saliency_scores" in submission[0] and "relevant_clip_ids" in ground_truth[0]:
         highlight_det_scores = eval_highlight(
             submission, ground_truth, verbose=verbose)
         eval_metrics.update(highlight_det_scores)

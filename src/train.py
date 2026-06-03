@@ -14,11 +14,8 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 from easydict import EasyDict
-torch.set_float32_matmul_precision('high')
-import torch.backends.cuda
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_math_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 from dataset import CGDETR_StartEndDataset, cg_detr_start_end_collate, cg_detr_prepare_batch_inputs
 from cg_detr import build_model
@@ -287,7 +284,11 @@ def main(opt, resume=None):
                 adapted_state_dict[compiled_k] = v
             else:
                 adapted_state_dict[clean_k] = v
-        model.load_state_dict(adapted_state_dict)
+        missing, unexpected = model.load_state_dict(adapted_state_dict, strict=False)
+        if missing:
+            logger.info(f"Missing keys (initialized randomly): {missing}")
+        if unexpected:
+            logger.info(f"Unexpected keys (ignored): {unexpected}")
         logger.info(f"Loaded checkpoint: {resume}")
 
     logger.info("Start Training...")

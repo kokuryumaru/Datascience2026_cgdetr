@@ -152,11 +152,7 @@ class CGDETR(nn.Module):
         super().__init__()
         self.args=args
         self.num_queries = num_queries
-        # self.transformer = transformer
-        self.transformer = torch.compile(
-            transformer, 
-            backend="inductor", mode="default", dynamic=True
-        )
+        self.transformer = transformer
         self.position_embed = position_embed
         self.txt_position_embed = txt_position_embed
         hidden_dim = transformer.d_model
