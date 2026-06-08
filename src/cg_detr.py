@@ -241,7 +241,20 @@ class CGDETR(nn.Module):
             else:
                 ori_vid = [v for v in vid]
 
+        # ========================================================
+        # 【修正】ランダムシフトによる時間軸（dim 1）のズレを強制吸収
+        # ========================================================
         if src_aud is not None:
+            if src_vid.shape[1] != src_aud.shape[1]:
+                # 短い方のフレーム数に合わせる（例: 299 と 300 なら 299 に揃える）
+                min_len = min(src_vid.shape[1], src_aud.shape[1])
+                src_vid = src_vid[:, :min_len, :]
+                src_aud = src_aud[:, :min_len, :]
+                
+                # 存在する src_vid_mask も同じフレーム数（dim 1）に切り詰める
+                src_vid_mask = src_vid_mask[:, :min_len]
+
+            # 形状が完全に揃った状態で結合
             src_vid = torch.cat([src_vid, src_aud], dim=2)
         
         src_vid = self.input_vid_proj(src_vid)

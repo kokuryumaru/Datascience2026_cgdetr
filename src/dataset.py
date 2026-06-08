@@ -193,17 +193,19 @@ class CGDETR_StartEndDataset(Dataset):
         # 時間軸のランダムシフト (Data Augmentation)
         # ========================================================
         if self.is_train and random.random() < self.shift_prob:
-            # GTの最小開始時刻と最大終了時刻を取得 (複数区間対応)
+            # GTの最小開始時刻と最大終了時刻を取得
             st_min = min([w[0] for w in meta["relevant_windows"]])
             ed_max = max([w[1] for w in meta["relevant_windows"]])
             
             st_frame_min = int(math.floor(st_min / self.clip_len))
             ed_frame_max = int(math.ceil(ed_max / self.clip_len))
             
-            # 左シフト(削り)の限界
+            # 映像を使わない audio_tef モードに対応するため、有効な最大長を切り替える
+            effective_max_l = self.max_v_l if self.use_video else self.max_a_l
+
+            # 左シフト(削り)と右シフト(パディング)の限界を計算
             max_left = max(0, st_frame_min - self.margin_frames)
-            # 右シフト(パディング)の限界
-            max_right = max(0, self.max_v_l - ed_frame_max - self.margin_frames)
+            max_right = max(0, effective_max_l - ed_frame_max - self.margin_frames)
             
             if max_left > 0 or max_right > 0:
                 std_dev = max(max_left, max_right) / 2.0 
@@ -211,42 +213,53 @@ class CGDETR_StartEndDataset(Dataset):
                 shift = max(-max_left, min(max_right, shift))
 
                 if shift != 0:
-                    # 映像特徴量のシフト
-                    if self.use_video:
+                    # 映像特徴量のシフト (使用する場合のみ)
+                    if self.use_video and "video_feat" in model_inputs:
                         v_feat = model_inputs["video_feat"]
                         if shift > 0:
-                            # 修正: F.padを使用 (最後の次元は0パディング、前の次元の先頭にshift分パディング)
                             v_feat = F.pad(v_feat, (0, 0, shift, 0))[:self.max_v_l]
                         else:
                             v_feat = v_feat[-shift:]
                         model_inputs["video_feat"] = v_feat
-                        ctx_l = len(v_feat)
                     
                     # 音声特徴量のシフト
-                    if self.use_audio:
+                    if self.use_audio and "audio_feat" in model_inputs:
                         a_feat = model_inputs["audio_feat"]
                         if shift > 0:
-                            # 修正: F.padを使用
                             a_feat = F.pad(a_feat, (0, 0, shift, 0))[:self.max_a_l]
                         else:
-                            a_feat = a_feat[-shift:]
+                            # 【安全弁】シフトで削りすぎて配列が空（長さ0）になるのを防ぐ
+                            if -shift >= len(a_feat):
+                                a_feat = a_feat[-1:] # 最低でも最後の1フレームを残す
+                            else:
+                                a_feat = a_feat[-shift:]
                         model_inputs["audio_feat"] = a_feat
-                        if not self.use_video:
-                            ctx_l = len(a_feat)
-                    
-                    # メタデータの時刻を同期して更新
+
+                    # 時刻の同期更新
                     shift_sec = shift * self.clip_len
                     for i in range(len(meta["relevant_windows"])):
                         meta["relevant_windows"][i][0] += shift_sec
                         meta["relevant_windows"][i][1] += shift_sec
         # ========================================================
 
+        # 最終的なデータ長（ctx_l）を現在の特徴量から厳密に再計算
+        if self.use_video and "video_feat" in model_inputs:
+            ctx_l = len(model_inputs["video_feat"])
+        elif self.use_audio and "audio_feat" in model_inputs:
+            ctx_l = len(model_inputs["audio_feat"])
+        else:
+            ctx_l = self.max_v_l
+
+        # 【絶対防御】何があっても ctx_l を 0 にしない、かつキャッシュの範囲内に収める
+        max_cache_len = len(self.tef_cache) - 1
+        ctx_l = max(1, min(ctx_l, max_cache_len))
 
         if self.use_tef:
-            tef = self.tef_cache[ctx_l]
+            tef = self.tef_cache[ctx_l] # これで絶対に KeyError: 0 は起きません
             if self.use_video:
                 model_inputs["video_feat"] = torch.cat([model_inputs["video_feat"], tef], dim=1)
             else:
+                # audio_tef モードの場合、モデルの仕様に合わせて video_feat の位置に TEF を格納
                 model_inputs["video_feat"] = tef
 
         # 4. ラベル（Span, Saliency）の取得
@@ -332,14 +345,58 @@ class CGDETR_StartEndDataset(Dataset):
 
 
     def _get_query_feat_by_qid(self, qid):
-        q_feat_path = join(self.q_feat_dir, f"qid{qid}.npz")
-        if not exists(q_feat_path):
+        if self.dset_name == 'tvsum' or self.dset_name == 'youtube_highlight':
+            q_feat_path = join(self.q_feat_dir, f"{qid}.npz")
+            q_feat = np.load(q_feat_path)
+            return torch.from_numpy(q_feat['token']) if self.dset_name == 'tvsum' else torch.from_numpy(q_feat['last_hidden_state'])
+        
+        elif self.dset_name == 'tacos':
+            q_feat_path = join(self.q_feat_dir, f"{qid}.npz")
+            q_feat = np.load(q_feat_path)[self.q_feat_type].astype(np.float32)
+            if self.q_feat_type == "last_hidden_state":
+                q_feat = q_feat[:self.max_q_l]
+            if self.normalize_t:
+                q_feat = l2_normalize_np_array(q_feat)
+
+        # --追加 M2D-CLAP テキスト特徴量用の処理--
+        elif self.dset_name == 'castella' and self.q_feat_type == 'last_hidden_state':
             q_feat_path = join(self.q_feat_dir, f"qid{qid}.npz")
-        q_feat = np.load(q_feat_path)[self.q_feat_type].astype(np.float32)            
-        if self.q_feat_type == "last_hidden_state":
-            q_feat = q_feat[:self.max_q_l]
-        if self.normalize_t:
-            q_feat = l2_normalize_np_array(q_feat)
+            # -- 追加：ファイルが存在しない場合はダミー特徴量を生成
+            if not exists(q_feat_path):
+                logger.warning(f"Castella text file missing, using dummy features for: {qid}")
+                q_feat = np.zeros((1, 768), dtype=np.float32)
+            else:
+                q_feat = np.load(q_feat_path)["last_hidden_state"].astype(np.float32)
+            if q_feat.ndim == 1:
+                q_feat = np.expand_dims(q_feat, axis=0) # (D, ) -> (1, D)
+            elif q_feat.ndim == 2 and q_feat.shape[0] != 1:
+                if q_feat.shape[1] == 768:
+                    pass
+                else:
+                    q_feat = q_feat.reshape(1, -1)
+            if self.normalize_t:
+                q_feat = l2_normalize_np_array(q_feat)
+
+        else:
+            # QVhighlight dataset
+            if "subs_train" in self.data_path: # for pretrain
+                vid = "_".join(qid.split("_")[:-1])
+                subid = qid.split("_")[-1]
+                q_feat_path = join(self.q_feat_dir, f"{vid}/{subid}.npz")
+            else:
+                q_feat_path = join(self.q_feat_dir, f"qid{qid}.npz")
+
+                # --追加：ファイルが存在しない場合はダミー特徴量を生成--
+                if not exists(q_feat_path):
+                    logger.warning(f"Text file missing, using dummy features for: {qid}")
+                    q_feat = np.zeros((1, 768), dtype=np.float32)
+                else:
+                    q_feat = np.load(q_feat_path)[self.q_feat_type].astype(np.float32)
+            if self.q_feat_type == "last_hidden_state":
+                q_feat = q_feat[:self.max_q_l]
+            if self.normalize_t:
+                q_feat = l2_normalize_np_array(q_feat)
+        
         return torch.from_numpy(q_feat)  # (D, ) or (Lq, D)
 
     def _get_video_feat_by_vid(self, vid):
@@ -364,10 +421,31 @@ class CGDETR_StartEndDataset(Dataset):
     def _get_audio_feat_by_vid(self, vid):
         a_feat_list = []
         for _feat_dir in self.a_feat_dirs:
-            _feat_path = join(_feat_dir, f"{vid}.npz")
-            _feat = np.load(_feat_path)["features"][:self.max_a_l].astype(np.float32)
-            _feat = l2_normalize_np_array(_feat) # normalize?
-            a_feat_list.append(_feat)
+            if self.dset_name == 'qvhighlight' or self.dset_name == 'qvhighlight_pretrain':
+                if self.a_feat_types == "pann":
+                    _feat_path = join(_feat_dir, f"{vid}.npy")
+                    _feat = np.load(_feat_path)[:self.max_a_l].astype(np.float32)
+                else:
+                    raise NotImplementedError
+                _feat = l2_normalize_np_array(_feat) # normalize?
+                a_feat_list.append(_feat)
+            elif self.dset_name in ['clotho-moment', 'unav100-subset', 'tut2017', 'castella']:
+                # --M2D-CLAPもCLAPと同じ動きをするように条件を追加--
+                if self.a_feat_types in ["clap", "m2dclap"]:
+                    _feat_path = join(_feat_dir, f"{vid}.npz")
+                    # --ファイルが存在しない場合はダミーを生成して返す
+                    if not exists(_feat_path):
+                        logger.warning(f"Audio file missing, using dummy features for: {vid}")
+                        _feat = np.zeros((300, 768), dtype=np.float32)
+                    else:
+                        _feat = np.load(_feat_path)["features"][:self.max_a_l].astype(np.float32)
+                else:
+                    raise NotImplementedError
+                _feat = l2_normalize_np_array(_feat) # normalize?
+                a_feat_list.append(_feat)
+            else:
+                raise NotImplementedError
+        
         # some features are slightly longer than the others
         min_len = min([len(e) for e in a_feat_list])
         a_feat_list = [e[:min_len] for e in a_feat_list]

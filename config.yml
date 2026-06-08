@@ -72,7 +72,7 @@ aux_loss: True
 model_ema: True
 ema_decay: 0.99
 ema_start_epoch: 25
-results_dir: results
+results_dir: results_m2d #results
 
 # Dataset: CASTELLA
 dset_name: castella
@@ -82,12 +82,12 @@ test_path: data/castella_test_release.jsonl
 max_q_l: 32
 max_a_l: 300
 
-# Features: CLAP (768-dim)
+# Features: M2D-CLAP (768-dim)
 ctx_mode: audio_tef
-a_feat_dir: features/castella/clap
-t_feat_dir: features/castella/clap_text
-a_feat_type: clap
-t_feat_type: clap
+a_feat_dir: /data1/y265607g/dcase_project/Datascience2026_cgdetr/features_2/castella/m2d_clap #/data1/y265607g/dcase_project/features/castella/clap       #80~83行目をm2d_clap用に変更
+t_feat_dir: /data1/y265607g/dcase_project/Datascience2026_cgdetr/features_2/castella/m2d_clap_text #/data1/y265607g/dcase_project/features/castella/clap_text
+a_feat_type: m2dclap #clap
+t_feat_type: m2dclap #clap
 v_feat_dim: 2
 a_feat_dim: 768
 t_feat_dim: 768

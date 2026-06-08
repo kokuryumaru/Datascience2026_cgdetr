@@ -280,3 +280,55 @@ features/ （CLAP特徴量）
 - `train.py` / `evaluate.py` は `src/` ディレクトリから実行してください。スクリプト内部で `os.chdir()` によりプロジェクトルートに移動するため、`data/` や `features/` などの相対パスが正しく解決されます。
 - config に書かれている `lighthouse-cgdetr` は旧ディレクトリ名です。実際のパスは `Datascience2026_cgdetr` です。
 - `private/higashino/code/` は CG-DETR の別実装（Sim-DETR 等の実験コード）です。`src/` とは互換性がないため混在させないでください。詳細は `private/higashino/README.md` を参照してください。
+
+
+-------------------------------------------------------------------------------------------------
+## M2D-CLAPへの置き換え
+
+共有した抽出済みの特徴量データ（ `m2d_features.zip` ）を使用する場合は、「追加パッケージ～特徴量抽出」の手順はスキップし、解凍したデータを配置するだけで使用可能です。
+
+### M2D-CLAPの使用
+- 取得したM2D-CLAP特徴量を任意の場所（ `Datascience2026_cgdetr/features/castella/m2d_clap` など）においてください。
+- `config.yml` の `a_feat_type` 、 `t_feat_type` を `m2dclap` に変更してください。
+
+### M2D-CLAPの作成：追加パッケージのインストール
+```bash
+pip install yt-dlp
+pip install --upgrade timm
+pip install sentence_transformers nnAudio
+```
+
+### M2D-CLAPリポジトリのcloneとチェックポイントのダウンロード
+公開しているM2D-CLAPの学習済みモデルをダウンロードします。
+```bash
+# 自分の作業ディレクトリに変更してください
+M2D_DIR=/data/your_username/m2d
+
+git clone https://github.com/nttcslab/m2d.git $M2D_DIR
+cd $M2D_DIR
+wget https://github.com/nttcslab/m2d/releases/download/v0.5.0/m2d_clap_vit_base-80x1001p16x16p16kpBpTI-2025.zip
+unzip m2d_clap_vit_base-80x1001p16x16p16kpBpTI-2025.zip
+```
+
+### 音声の準備
+```bash
+# 自分の作業ディレクトリ
+YOUR_DIR=/data/your_username
+cd $YOUR_DIR
+git clone https://github.com/h-munakata/CASTELLA-audio.git $YOUR_DIR
+git clone https://github.com/line/CASTELLA.git $YOUR_DIR
+
+# バックグラウンドでダウンロードを実行
+nohup python CASTELLA-audio/script/download_audio.py CASTELLA/json/en/train.json > download_log.txt 2>&1 &
+
+# 進捗確認
+tail download_log.txt
+```
+
+### 特徴量抽出
+ダウンロード完了後に実行してください。
+```bash
+python src/extract_m2d_features.py --split train
+python src/extract_m2d_features.py --split val
+python src/extract_m2d_features.py --split test
+```
