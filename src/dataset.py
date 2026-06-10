@@ -361,12 +361,7 @@ class CGDETR_StartEndDataset(Dataset):
         # --追加 M2D-CLAP テキスト特徴量用の処理--
         elif self.dset_name == 'castella' and self.q_feat_type == 'last_hidden_state':
             q_feat_path = join(self.q_feat_dir, f"qid{qid}.npz")
-            # -- 追加：ファイルが存在しない場合はダミー特徴量を生成
-            if not exists(q_feat_path):
-                logger.warning(f"Castella text file missing, using dummy features for: {qid}")
-                q_feat = np.zeros((1, 768), dtype=np.float32)
-            else:
-                q_feat = np.load(q_feat_path)["last_hidden_state"].astype(np.float32)
+            q_feat = np.load(q_feat_path)["last_hidden_state"].astype(np.float32)
             if q_feat.ndim == 1:
                 q_feat = np.expand_dims(q_feat, axis=0) # (D, ) -> (1, D)
             elif q_feat.ndim == 2 and q_feat.shape[0] != 1:
@@ -433,12 +428,7 @@ class CGDETR_StartEndDataset(Dataset):
                 # --M2D-CLAPもCLAPと同じ動きをするように条件を追加--
                 if self.a_feat_types in ["clap", "m2dclap"]:
                     _feat_path = join(_feat_dir, f"{vid}.npz")
-                    # --ファイルが存在しない場合はダミーを生成して返す
-                    if not exists(_feat_path):
-                        logger.warning(f"Audio file missing, using dummy features for: {vid}")
-                        _feat = np.zeros((300, 768), dtype=np.float32)
-                    else:
-                        _feat = np.load(_feat_path)["features"][:self.max_a_l].astype(np.float32)
+                    _feat = np.load(_feat_path)["features"][:self.max_a_l].astype(np.float32)
                 else:
                     raise NotImplementedError
                 _feat = l2_normalize_np_array(_feat) # normalize?
