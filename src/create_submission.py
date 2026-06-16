@@ -55,8 +55,6 @@ def eval_epoch_post_processing(submission, opt, gt_data, save_submission_filenam
 @torch.no_grad()
 def compute_mr_results(model, eval_loader, opt, criterion=None):
     batch_input_fn = cg_detr_prepare_batch_inputs if opt.model_name == 'cg_detr' else prepare_batch_inputs
-    loss_meters = defaultdict(AverageMeter)
-
     mr_res = []
     for batch in tqdm(eval_loader, desc="compute st ed scores"):
         query_meta = batch[0]
@@ -73,38 +71,34 @@ def compute_mr_results(model, eval_loader, opt, criterion=None):
             cur_ranked_preds = torch.cat([spans, score[:, None]], dim=1).tolist()
             cur_ranked_preds = sorted(cur_ranked_preds, key=lambda x: x[2], reverse=True)
             cur_ranked_preds = [[float(f"{e:.4f}") for e in row] for row in cur_ranked_preds]
-
             cur_query_pred = dict(
                 qid=meta["qid"],
                 query=meta["query"],
                 vid=meta["vid"],
                 pred_relevant_windows=cur_ranked_preds,
             )
-
             mr_res.append(cur_query_pred)
-
-        if criterion:
-            loss_dict = criterion(outputs, targets)
-            weight_dict = criterion.weight_dict
-            losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-            loss_dict["loss_overall"] = float(losses)
-            for k, v in loss_dict.items():
-                loss_meters[k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
 
     post_processor = PostProcessorDETR(
         clip_length=opt.clip_length, min_ts_val=0, max_ts_val=300,
         min_w_l=1, max_w_l=300, move_window_method="left",
         process_func_names=("clip_ts", "round_multiple")
     )
-
+    
     mr_res = post_processor(mr_res)
-    return mr_res, loss_meters
+
+    # finally remove scores from each prediction
+    results = []
+    for mr in mr_res:
+        mr['pred_relevant_windows'] = [[start, end] for start, end, _ in mr['pred_relevant_windows']]
+        results.append(mr)
+    return results
 
 
 def get_eval_res(model, eval_loader, opt, criterion):
     """compute and save query and video proposal embeddings"""
-    eval_res, eval_loss_meters = compute_mr_results(model, eval_loader, opt, criterion)
-    return eval_res, eval_loss_meters
+    eval_res = compute_mr_results(model, eval_loader, opt, criterion)
+    return eval_res
 
 
 def eval_epoch(model, eval_dataset, opt, save_submission_filename, criterion):
@@ -120,10 +114,10 @@ def eval_epoch(model, eval_dataset, opt, save_submission_filename, criterion):
         shuffle=False,
     )
 
-    submission, eval_loss_meters = get_eval_res(model, eval_loader, opt, criterion)        
-    metrics, latest_file_paths = eval_epoch_post_processing(
-        submission, opt, eval_dataset.data, save_submission_filename)
-    return metrics, eval_loss_meters, latest_file_paths
+    submission = get_eval_res(model, eval_loader, opt, criterion)        
+    logger.info("Saving/Evaluating before nms results")
+    submission_path = os.path.join(opt.results_dir, save_submission_filename)
+    save_jsonl(submission, submission_path)
 
 
 def setup_model(opt):
@@ -139,7 +133,6 @@ def setup_model(opt):
     param_dicts = [{"params": [p for n, p in model.named_parameters() if p.requires_grad]}]
     optimizer = torch.optim.AdamW(param_dicts, lr=opt.lr, weight_decay=opt.wd)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, opt.lr_drop)
-
     return model, criterion, optimizer, lr_scheduler
 
 
@@ -148,10 +141,10 @@ def start_inference(opt):
 
     # dataset & data loader
     dataset_config = EasyDict(
-        data_path=opt.val_path if opt.eval_split_name == 'val' else opt.test_path,
+        data_path=opt.submission_path,
         ctx_mode=opt.ctx_mode,
-        a_feat_dir=opt.a_feat_dir,
-        q_feat_dir=opt.t_feat_dir,
+        a_feat_dir=opt.a_sub_feat_dir,
+        q_feat_dir=opt.t_sub_feat_dir,
         q_feat_type="last_hidden_state",
         a_feat_type=opt.a_feat_type,
         max_q_l=opt.max_q_l,
@@ -159,7 +152,7 @@ def start_inference(opt):
         clip_len=opt.clip_length,
         max_windows=opt.max_windows,
         span_loss_type=opt.span_loss_type,
-        load_labels=True,
+        load_labels=False,
     )
     
     eval_dataset = StartEndDataset(**dataset_config)
@@ -169,24 +162,22 @@ def start_inference(opt):
     logger.info("Model checkpoint: {}".format(opt.model_path))
 
     logger.info("Starting inference...")
-    save_submission_filename = "submission.jsonl"
+    save_submission_filename = "private_submission.jsonl"
 
     with torch.no_grad():
-        metrics, eval_loss_meters, latest_file_paths = \
-            eval_epoch(model, eval_dataset, opt, save_submission_filename, criterion)
-    logger.info("metrics_no_nms {}".format(pprint.pformat(metrics["brief"], indent=4)))
+        eval_epoch(model, eval_dataset, opt, save_submission_filename, criterion)
+
+    logger.info("Done")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', '-c', type=str, required=True, help='config path')
     parser.add_argument('--model_path', '-m', type=str, required=True, help='model checkpoint path')
-    parser.add_argument('--split', '-s', type=str, default='val', choices=['val', 'test'], help='split name: val or test')
     args = parser.parse_args()
     option_manager = BaseOptions(args.config)
     option_manager.parse()
     opt = option_manager.option
-
     opt.model_path = args.model_path
-    opt.eval_split_name = args.split
+    opt.eval_split_name = "private"
     start_inference(opt)
